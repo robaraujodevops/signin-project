@@ -1,20 +1,45 @@
 include help.mk
 
-workdir=/app
+.PHONY: local-ssl image-dev run-dev drop-dev logs-dev clean install-package check-versions bump-versions update lint-yaml tsc build image image-push
+.DEFAULT_GOAL := help
 
-dev_image=next-dev-image:latest
-prod_image=next-prod-image:latest
-img_exists=$(shell docker images $(dev_image) | grep next-dev || echo false)
+ifneq ("$(wildcard ./dev/.env)","")
+  include ./dev/.env
+  export
+endif
 
-run=docker run \
-	--network host \
-	--rm \
-	--user $(shell id -u) \
+REGISTRY_NAMESPACE = "${CI_REGISTRY_IMAGE}"
 
-run_app=$(run) \
-	-v `pwd`:$(workdir) \
-	--name next-app-dev \
-	--tty --interactive $(dev_image) \
+NAME          = $(shell sed -n -e '/name/ s/.*: \"\(.*\)\",/\1/p' package.json)
+VERSION       = $(shell sed -n -e '/version/ s/.*: \"\(.*\)\",/\1/p' package.json)
+IMAGE         = $(REGISTRY_NAMESPACE):$(VERSION)
+DEBUG?        = false
+
+COMPOSE_FILE   = dev/docker/docker-compose.yaml
+SSL_HOST       = ${NGINX_HOST}## Must use the env var placed in dev/.env file
+SSL_CERT_PATH  = dev/nginx/certs
+IMAGE_DEV      = $(REGISTRY_NAMESPACE):dev
+RUN            = docker run --rm -v $(PWD):/app --user $(shell id -u):$(shell id -g) --name $(NAME) $(IMAGE_DEV) 
+RUN_DEV        = docker-compose \
+							   --project-directory dev \
+							   --file $(COMPOSE_FILE)
+
+
+package?   = ""
+workspace? = ""
+
+guard-%:
+	@ if [ "${${*}}" = "" ]; then \
+        echo "argument '$*' is required"; \
+        exit 1; \
+    fi
+
+# GIT setup, configure the default strategy for git pull and push
+ifneq ("$(shell git config --local pull.rebase)", "true")
+$(shell git config --local pull.rebase true)
+$(shell git config --local alias.pushf "push --force-with-lease")
+$(info $(shell tput setaf 3)>> Backstage git pattern not configured, executing git setup$(shell tput sgr0))
+endif
 
 .PHONY: init-project
 init-project: ##@ Builds development image
@@ -26,17 +51,58 @@ init-project: ##@ Builds development image
 			yarn create next-app --typescript $(workdir)/next-app; \
 	fi
 
-.PHONY: build-dev-image
-build-dev-image: ##@dev Build dev image
-ifeq ($(img_exists), false)
-		docker build -t $(dev_image) $(buildarg) -f build/dev/Dockerfile .
-endif
+.PHONY: local-ssl
+local-ssl: guard-SSL_HOST guard-SSL_CERT_PATH ##@Local-SSL Creates local certs to run with SSL.
+	@mkcert -install && \
+	mkcert \
+		-cert-file $(SSL_CERT_PATH)/$(SSL_HOST).crt \
+		-key-file $(SSL_CERT_PATH)/$(SSL_HOST).key \
+		$(SSL_HOST) \
+	|| echo "mkcert is not installed";
+
+.PHONY: image-dev
+image-dev: guard-IMAGE_DEV ##@Dev Build development base image.
+	@echo Building Developer image...
+	@docker build -f ./dev/docker/Dockerfile -t $(IMAGE_DEV) .
+	@docker push $(IMAGE_DEV)
 
 .PHONY: run-dev
-run-dev: build-dev-image ##@dev Run development stack
-	$(run_app) \
-		yarn run dev
+run-dev: guard-COMPOSE_FILE local-ssl update ##@Dev Run local dev env.
+	@echo Running Developer environment...
+	@$(RUN_DEV) up -d
 
-.PHONY: build-app
-build-app: ##@build Build app
-	docker build -t $(prod_image) -f build/prod/Dockerfile next-app 
+.PHONY: drop-dev
+drop-dev: guard-COMPOSE_FILE ##@Dev Drop local dev env.
+	@echo Dropping Developer environment...
+	@$(RUN_DEV) down --remove-orphans -v
+
+.PHONY: logs-dev
+logs-dev: guard-COMPOSE_FILE ##@Dev Run local logs.
+	@echo Logging Developer environment...
+	@$(RUN_DEV) logs -f 
+
+.PHONY: clean
+clean: ##@Clean Clear current dependencies paths.
+	@echo Cleaning dependencies paths...
+	@$(RUN) rm -fr node_modules 
+
+.PHONY: install-package
+install-package: guard-WORKSPACE guard-PACKAGE ##@Dependencies Installs new packages at app or backend workspace.
+	@$(RUN) yarn workspace $(WORKSPACE) add $(PACKAGE)
+
+.PHONY: image
+image: ##@Build Build docker image (to debug add image_debug=true).
+ifeq ($(DEBUG), false)
+	@echo "Build docker backstage:$(VERSION) image."
+	@DOCKER_BUILDKIT=1 \
+		docker build --pull --tag $(IMAGE) . > /dev/null
+else
+	@echo "Build docker backstage:$(VERSION) image in debug mode."
+	@DOCKER_BUILDKIT=1 \
+		docker build --pull --tag $(IMAGE) .
+endif
+
+.PHONY: image-push
+image-push: ##@Build Push image to registry.
+	@echo Pushing 
+	@docker push $(IMAGE)
